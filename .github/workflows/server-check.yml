@@ -1,0 +1,120 @@
+name: Server Setter Check
+
+on:
+  workflow_dispatch:
+    inputs:
+      server_name:
+        description: 'Server Name (e.g., c835uvdctxdr)'
+        required: true
+        type: string
+      inc_number:
+        description: 'INC Number (optional)'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  check-server:
+    name: Check Server Health
+    # Self-hosted Linux runner for internal network access
+    runs-on: [self-hosted, linux]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Chrome
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable || true
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Server Check
+        id: check
+        run: |
+          python -c "
+          import yaml
+          import json
+          from gotmon_checker import GotmonChecker
+
+          # Load config
+          with open('config.yaml', 'r') as f:
+              config = yaml.safe_load(f)
+
+          # Override to run headless in CI
+          config['browser']['headless'] = True
+
+          # Run check
+          checker = GotmonChecker(config)
+          result = checker.check_server('${{ inputs.server_name }}')
+          result['inc_number'] = '${{ inputs.inc_number }}'
+
+          # Print results
+          print('='*60)
+          print('SERVER CHECK RESULTS')
+          print('='*60)
+          print(f\"Server Name: {result['server_name']}\")
+          print(f\"INC Number: {result.get('inc_number', 'N/A')}\")
+          print('-'*60)
+          print(f\"ServerSitter Status: {result['server_sitter_status'].upper() if result['server_sitter_status'] else 'UNKNOWN'}\")
+          print(f\"PerfStat Accessible: {'YES' if result['perfstat_accessible'] else 'NO'}\")
+          if result.get('perfstat_error'):
+              print(f\"PerfStat Error: {result['perfstat_error']}\")
+          if result.get('cpu_usage') is not None:
+              print(f\"CPU Usage (Max): {result['cpu_usage']}%\")
+          print('-'*60)
+          print(f\"RECOMMENDED ACTION: {result['action'].upper() if result['action'] else 'UNKNOWN'}\")
+          print('-'*60)
+
+          if result['action'] == 'close':
+              print('STATUS: ✅ HEALTHY - INC CAN BE CLOSED')
+              print(f\"Close Statement:\\n{result.get('close_statement', '')}\")
+          elif result['action'] == 'escalate':
+              print('STATUS: ⚠️ ESCALATION REQUIRED')
+              print(f\"Escalate To: {result.get('escalate_to', 'N/A')}\")
+              print(f\"Description:\\n{result.get('escalation_description', '')}\")
+
+          print('='*60)
+
+          # Set output for subsequent steps
+          with open('result.json', 'w') as f:
+              json.dump(result, f)
+          "
+
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-check-result
+          path: result.json
+
+      - name: Summary
+        run: |
+          echo "## Server Check Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          python -c "
+          import json
+          with open('result.json', 'r') as f:
+              result = json.load(f)
+
+          print(f\"| Property | Value |\")
+          print(f\"|----------|-------|\")
+          print(f\"| Server Name | \`{result['server_name']}\` |\")
+          print(f\"| ServerSitter Status | **{(result['server_sitter_status'] or 'unknown').upper()}** |\")
+          print(f\"| PerfStat | {'✅ Accessible' if result['perfstat_accessible'] else '❌ Error'} |\")
+          if result.get('cpu_usage') is not None:
+              cpu_status = '✅' if result['cpu_usage'] < 80 else '⚠️'
+              print(f\"| CPU Usage | {cpu_status} {result['cpu_usage']}% |\")
+          print(f\"| **Action** | **{(result['action'] or 'unknown').upper()}** |\")
+
+          if result['action'] == 'escalate':
+              print(f\"| Escalate To | {result.get('escalate_to', 'N/A')} |\")
+          " >> $GITHUB_STEP_SUMMARY
