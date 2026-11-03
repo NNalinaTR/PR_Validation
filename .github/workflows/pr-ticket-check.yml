@@ -12,6 +12,7 @@ jobs:
   ticket-check:
     name: Require ADO ticket (AB#)
     runs-on: ubuntu-latest
+    
 
     steps:
       - name: Check PR title and commit messages for AB#<id>
