@@ -4,8 +4,6 @@ on:
   pull_request:
     types: [opened, edited, reopened, synchronize]
 
-
-
 permissions:
   contents: read
   pull-requests: read
@@ -14,6 +12,7 @@ jobs:
   ticket-check:
     name: Require ADO ticket (AB#)
     runs-on: ubuntu-latest
+    
 
     steps:
       - name: Check PR title and commit messages for AB#<id>

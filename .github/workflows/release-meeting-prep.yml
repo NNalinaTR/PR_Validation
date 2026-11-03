@@ -14,7 +14,7 @@ on:
         default: '1'
         type: string
       ai_summary:
-        description: 'Add AI summary and release notes (Copilot CLI, needs COPILOT_PAT secret)'
+        description: 'Add AI summary and release notes (Apex AI, needs APEX_* secrets and a TR-network runner)'
         required: false
         default: true
         type: boolean
@@ -34,9 +34,11 @@ permissions:
 jobs:
   prep:
     name: Prepare release item meeting
-    runs-on: ubuntu-latest
+    # Apex is only reachable from the TR network: set the RUNNER_LABELS variable to a TR
+    # self-hosted runner, e.g. ["self-hosted","linux"]. Defaults to GitHub-hosted (no Apex).
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS || '"ubuntu-latest"') }}
     env:
-      HAS_COPILOT_PAT: ${{ secrets.COPILOT_PAT != '' }}
+      HAS_APEX: ${{ secrets.APEX_CLIENT_ID != '' && secrets.APEX_CLIENT_SECRET != '' && vars.APEX_BASE_URL != '' }}
 
     steps:
       - name: Checkout (with tags)
@@ -55,33 +57,28 @@ jobs:
             const { collect } = require('./.github/scripts/release-meeting-prep.js');
             await collect({ github, context, core });
 
-      # AI step: swap this block for an Apex API call later; it only needs to write ai-summary.md.
-      - name: Set up Node.js for Copilot CLI
-        if: inputs.ai_summary && steps.collect.outputs.pr_count != '0' && env.HAS_COPILOT_PAT == 'true'
-        uses: actions/setup-node@v7
-        with:
-          node-version: '22'
-
-      - name: Install Copilot CLI
-        if: inputs.ai_summary && steps.collect.outputs.pr_count != '0' && env.HAS_COPILOT_PAT == 'true'
-        run: npm install -g @github/copilot
-
-      - name: AI summary
+      - name: AI summary (Apex)
         id: ai
-        if: inputs.ai_summary && steps.collect.outputs.pr_count != '0' && env.HAS_COPILOT_PAT == 'true'
+        if: inputs.ai_summary && steps.collect.outputs.pr_count != '0' && env.HAS_APEX == 'true'
         continue-on-error: true
+        timeout-minutes: 15
+        uses: actions/github-script@v8
         env:
-          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
-        run: |
-          copilot -p "$(cat release-prompt.txt)" -s --no-ask-user > ai-summary.md
-          echo "AI summary written ($(wc -c < ai-summary.md) bytes)."
+          APEX_BASE_URL: ${{ vars.APEX_BASE_URL }}
+          APEX_APP_ID: ${{ vars.APEX_APP_ID }}
+          APEX_CLIENT_ID: ${{ secrets.APEX_CLIENT_ID }}
+          APEX_CLIENT_SECRET: ${{ secrets.APEX_CLIENT_SECRET }}
+        with:
+          script: |
+            const { aiSummary } = require('./.github/scripts/release-meeting-prep.js');
+            await aiSummary({ core });
 
       - name: Publish report and meeting issue
         id: publish
         uses: actions/github-script@v8
         env:
           CREATE_ISSUE: ${{ inputs.create_issue }}
-          AI_STATUS: ${{ !inputs.ai_summary && 'disabled' || steps.collect.outputs.pr_count == '0' && 'no-prs' || env.HAS_COPILOT_PAT != 'true' && 'no-secret' || steps.ai.outcome }}
+          AI_STATUS: ${{ !inputs.ai_summary && 'disabled' || steps.collect.outputs.pr_count == '0' && 'no-prs' || env.HAS_APEX != 'true' && 'no-secret' || steps.ai.outcome }}
         with:
           script: |
             const { publish } = require('./.github/scripts/release-meeting-prep.js');
