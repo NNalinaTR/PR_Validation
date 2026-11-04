@@ -101,7 +101,330 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ inputs.release_version }}
           BASE_BRANCH: ${{ inputs.base_branch }}
-        run: python .github/scripts/release_item_preparation.py
+        run: |
+          python - <<'PY'
+          #!/usr/bin/env python3
+          """Stage 1 of .github/workflows/release-item-preparation.yml.
+          
+          Builds the next release item from:
+            * PRs merged into the base branch after the last RC branch was cut (and not already in it)
+            * PRs / commits added to the last RC branch after it was cut
+          then works out the overall change size and validates ADO stories in PR titles.
+          Uses only the Python standard library.
+          """
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import urllib.error
+          import urllib.request
+          from datetime import datetime, timezone
+          
+          RC_BRANCH = re.compile(r"^(\d+)\.(\d+)\.(\d+)-RC(\d+)$")
+          ADO_STORY = re.compile(r"\bAB#\d+\b")
+          SIZE_ORDER = ["XS", "S", "M", "L", "XL", "XXL"]
+          SIZE_LABEL = re.compile(r"^size\s*[/:\-]?\s*(XXL|XL|XS|S|M|L)$", re.IGNORECASE)
+          # (max lines changed, size); anything larger is XL.
+          LINE_BUCKETS = [(10, "XS"), (100, "S"), (500, "M"), (1000, "L")]
+          REMOTE = "origin"
+          MD_FILE = "release-item.md"
+          JSON_FILE = "release-item.json"
+          
+          
+          class GitHub:
+              def __init__(self, token, repo, api_url="https://api.github.com"):
+                  self.token = token
+                  self.repo = repo
+                  self.api_url = api_url.rstrip("/")
+          
+              def _request(self, url):
+                  req = urllib.request.Request(url, headers={
+                      "Authorization": f"Bearer {self.token}",
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "release-item-preparation",
+                  })
+                  try:
+                      with urllib.request.urlopen(req, timeout=60) as res:
+                          return json.loads(res.read().decode("utf-8")), res.headers.get("Link", "")
+                  except urllib.error.HTTPError as e:
+                      raise RuntimeError(f"GitHub API {url} failed (HTTP {e.code}): {e.read().decode('utf-8', 'replace')[:300]}")
+          
+              def get(self, path):
+                  return self._request(f"{self.api_url}/repos/{self.repo}{path}")[0]
+          
+              def paginate(self, path, stop=None):
+                  """Yield items page by page; stop(page) returning True ends pagination after that page."""
+                  url = f"{self.api_url}/repos/{self.repo}{path}"
+                  while url:
+                      page, link = self._request(url)
+                      yield from page
+                      if not page or (stop and stop(page)):
+                          return
+                      m = re.search(r'<([^>]+)>;\s*rel="next"', link)
+                      url = m.group(1) if m else None
+          
+          
+          def git(*args, check=True):
+              res = subprocess.run(["git", *args], capture_output=True, text=True)
+              if check and res.returncode != 0:
+                  raise RuntimeError(f"git {' '.join(args)} failed: {res.stderr.strip()}")
+              return res.stdout.strip()
+          
+          
+          def parse_time(value):
+              return datetime.fromisoformat(value.replace("Z", "+00:00"))
+          
+          
+          def find_last_rc(branches):
+              """Return the highest X.Y.Z-RCn branch name; suffixed variants (e.g. -coco, -old) are ignored."""
+              candidates = [(tuple(int(g) for g in m.groups()), b) for b in branches if (m := RC_BRANCH.match(b))]
+              return max(candidates)[1] if candidates else None
+          
+          
+          def next_version(rc_branch):
+              major, minor, _patch, _rc = (int(g) for g in RC_BRANCH.match(rc_branch).groups())
+              return f"{major}.{minor + 1}.0"
+          
+          
+          def remote_branches():
+              out = git("for-each-ref", "--format=%(refname:strip=3)", f"refs/remotes/{REMOTE}")
+              return [b for b in out.splitlines() if b and b != "HEAD"]
+          
+          
+          def is_ancestor(sha, ref):
+              return bool(sha) and subprocess.run(
+                  ["git", "merge-base", "--is-ancestor", sha, ref], capture_output=True
+              ).returncode == 0
+          
+          
+          def pr_size(labels, additions, deletions):
+              for name in labels:
+                  m = SIZE_LABEL.match(name.strip())
+                  if m:
+                      return m.group(1).upper(), f"label `{name}`"
+              lines = additions + deletions
+              size = next((s for limit, s in LINE_BUCKETS if lines <= limit), "XL")
+              return size, f"{lines} lines changed"
+          
+          
+          def overall_size(prs):
+              if not prs:
+                  return None, []
+              top = max(prs, key=lambda p: SIZE_ORDER.index(p["size"]))["size"]
+              return top, [p["number"] for p in prs if p["size"] == top]
+          
+          
+          def collect(gh, base, rc, release_version):
+              rc_ref, base_ref = f"{REMOTE}/{rc}", f"{REMOTE}/{base}"
+              cut_sha = git("merge-base", base_ref, rc_ref)
+              cut_date = parse_time(git("log", "-1", "--format=%cI", cut_sha))
+              print(f"Last RC: {rc} | cut from {base} at {cut_sha[:7]} ({cut_date.isoformat()})")
+          
+              found = {}
+          
+              def add(pr, source):
+                  if pr["number"] in found:
+                      if source not in found[pr["number"]]["sources"]:
+                          found[pr["number"]]["sources"].append(source)
+                  else:
+                      found[pr["number"]] = {"pr": pr, "sources": [source]}
+          
+              # 1. PRs merged into the base branch after the RC cut that are not already in the RC branch.
+              stop = lambda page: parse_time(page[-1]["updated_at"]) < cut_date
+              for pr in gh.paginate(f"/pulls?state=closed&base={base}&sort=updated&direction=desc&per_page=100", stop):
+                  if pr.get("merged_at") and parse_time(pr["merged_at"]) > cut_date and not is_ancestor(pr.get("merge_commit_sha"), rc_ref):
+                      add(pr, base)
+          
+              # 2. Commits added to the RC branch after it was cut, mapped back to their PRs where possible.
+              direct_commits = []
+              log = git("log", "--no-merges", "--format=%H%x1f%an%x1f%cI%x1f%s", f"{cut_sha}..{rc_ref}")
+              for line in filter(None, log.splitlines()):
+                  sha, author, date, subject = line.split("\x1f", 3)
+                  pulls = [p for p in gh.get(f"/commits/{sha}/pulls") if p.get("merged_at")]
+                  for pr in pulls:
+                      add(pr, rc)
+                  if not pulls:
+                      direct_commits.append({"sha": sha, "author": author, "date": date, "subject": subject,
+                                             "ado_stories": ADO_STORY.findall(subject)})
+          
+              prs = []
+              for number, entry in sorted(found.items()):
+                  full = gh.get(f"/pulls/{number}")
+                  labels = [label["name"] for label in full.get("labels", [])]
+                  size, basis = pr_size(labels, full.get("additions", 0), full.get("deletions", 0))
+                  prs.append({
+                      "number": number,
+                      "title": full["title"],
+                      "url": full["html_url"],
+                      "author": (full.get("user") or {}).get("login", "unknown"),
+                      "merged_at": full.get("merged_at"),
+                      "sources": entry["sources"],
+                      "ado_stories": ADO_STORY.findall(full["title"]),
+                      "labels": labels,
+                      "additions": full.get("additions", 0),
+                      "deletions": full.get("deletions", 0),
+                      "changed_files": full.get("changed_files", 0),
+                      "size": size,
+                      "size_basis": basis,
+                  })
+          
+              size, size_drivers = overall_size(prs)
+              return {
+                  "release_version": release_version,
+                  "repository": gh.repo,
+                  "base_branch": base,
+                  "last_rc": rc,
+                  "rc_cut_sha": cut_sha,
+                  "rc_cut_date": cut_date.isoformat(),
+                  "change_size": size,
+                  "change_size_drivers": size_drivers,
+                  "prs": prs,
+                  "missing_ado": [p["number"] for p in prs if not p["ado_stories"]],
+                  "direct_rc_commits": direct_commits,
+                  "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+              }
+          
+          
+          def cell(text):
+              return str(text).replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+          
+          
+          def build_markdown(item, run_url=""):
+              prs = item["prs"]
+              missing = [p for p in prs if not p["ado_stories"]]
+              stories = sorted({s for p in prs for s in p["ado_stories"]}, key=lambda s: int(s[3:]))
+              from_base = sum(1 for p in prs if item["base_branch"] in p["sources"])
+              from_rc = sum(1 for p in prs if item["last_rc"] in p["sources"])
+              size = f"**{item['change_size']}** (driven by {', '.join(f'#{n}' for n in item['change_size_drivers'])})" \
+                  if item["change_size"] else "N/A (no PRs)"
+              ado_status = "✅ All PRs have an ADO story" if not missing else f"❌ {len(missing)} PR(s) missing an ADO story"
+          
+              lines = [
+                  f"# Release Item: {item['release_version']}",
+                  "",
+                  "## 1. Release overview",
+                  "",
+                  "| Field | Value |",
+                  "|-------|-------|",
+                  f"| Release version | **{item['release_version']}** |",
+                  f"| Repository | {item['repository']} |",
+                  f"| Base branch | `{item['base_branch']}` |",
+                  f"| Previous RC branch | `{item['last_rc']}` |",
+                  f"| RC cut point | `{item['rc_cut_sha'][:7]}` ({item['rc_cut_date']}) |",
+                  f"| Change size | {size} |",
+                  f"| PRs included | {len(prs)} ({from_base} from `{item['base_branch']}`, {from_rc} from `{item['last_rc']}`) |",
+                  f"| Direct RC commits (no PR) | {len(item['direct_rc_commits'])} |",
+                  f"| ADO stories | {', '.join(stories) or 'none'} |",
+                  f"| ADO validation | {ado_status} |",
+                  f"| Generated | {item['generated_at']} |",
+                  "",
+                  "## 2. Changes included",
+                  "",
+              ]
+              if prs:
+                  lines += [
+                      "| PR | Title | Author | Source | Merged | ADO story | Size |",
+                      "|----|-------|--------|--------|--------|-----------|------|",
+                  ]
+                  for p in prs:
+                      ado = ", ".join(p["ado_stories"]) or "❌ missing"
+                      source = ", ".join(f"`{s}`" for s in p["sources"])
+                      lines.append(
+                          f"| [#{p['number']}]({p['url']}) | {cell(p['title'])} | {cell(p['author'])} | {source} | "
+                          f"{(p['merged_at'] or '')[:10]} | {ado} | {p['size']} ({cell(p['size_basis'])}) |"
+                      )
+              else:
+                  lines.append("No PRs merged since the last RC branch was cut.")
+          
+              lines += ["", "## 3. ADO story validation", ""]
+              if missing:
+                  lines.append("The following PRs do not have an ADO story (`AB#<id>`) in their title:")
+                  lines.append("")
+                  lines += [f"- [ ] [#{p['number']}]({p['url']}) {cell(p['title'])} - @{p['author']}" for p in missing]
+              else:
+                  lines.append("✅ Every PR has an ADO story in its title.")
+          
+              if item["direct_rc_commits"]:
+                  lines += [
+                      "",
+                      f"## 4. Direct commits on `{item['last_rc']}` (no PR)",
+                      "",
+                      "| Commit | Subject | Author | Date | ADO story |",
+                      "|--------|---------|--------|------|-----------|",
+                  ]
+                  for c in item["direct_rc_commits"]:
+                      ado = ", ".join(c["ado_stories"]) or "❌ missing"
+                      lines.append(f"| `{c['sha'][:7]}` | {cell(c['subject'])} | {cell(c['author'])} | {c['date'][:10]} | {ado} |")
+          
+              lines += [
+                  "",
+                  "## Release meeting checklist",
+                  "",
+                  "- [ ] Resolve PRs missing an ADO story",
+                  "- [ ] Confirm linked ADO stories are in the correct state",
+                  f"- [ ] Agree change size (**{item['change_size'] or 'N/A'}**) and required approvals",
+                  "- [ ] Confirm deployment window and rollback plan",
+                  "- [ ] Go / No-go decision",
+              ]
+              if run_url:
+                  lines += ["", f"<sub>Generated by [Release Item Preparation]({run_url}).</sub>"]
+              return "\n".join(lines) + "\n"
+          
+          
+          def write_outputs(item):
+              outputs = {
+                  "release_version": item["release_version"],
+                  "last_rc": item["last_rc"],
+                  "change_size": item["change_size"] or "",
+                  "pr_count": str(len(item["prs"])),
+                  "missing_ado_count": str(len(item["missing_ado"])),
+              }
+              path = os.environ.get("GITHUB_OUTPUT")
+              if path:
+                  with open(path, "a", encoding="utf-8") as f:
+                      f.writelines(f"{k}={v}\n" for k, v in outputs.items())
+          
+          
+          def main():
+              repo = os.environ["GITHUB_REPOSITORY"]
+              gh = GitHub(os.environ["GITHUB_TOKEN"], repo, os.environ.get("GITHUB_API_URL", "https://api.github.com"))
+              base = os.environ.get("BASE_BRANCH", "").strip() or gh.get("")["default_branch"]
+          
+              rc = find_last_rc(remote_branches())
+              if not rc:
+                  print(f"::error::No RC branch matching X.Y.Z-RCn (e.g. 1.45.0-RC1) found on {REMOTE}.")
+                  return 1
+              release_version = os.environ.get("RELEASE_VERSION", "").strip() or next_version(rc)
+          
+              item = collect(gh, base, rc, release_version)
+              run_url = ""
+              if os.environ.get("GITHUB_RUN_ID"):
+                  run_url = f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{repo}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+              markdown = build_markdown(item, run_url)
+          
+              with open(JSON_FILE, "w", encoding="utf-8") as f:
+                  json.dump(item, f, indent=2)
+              with open(MD_FILE, "w", encoding="utf-8") as f:
+                  f.write(markdown)
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with open(summary, "a", encoding="utf-8") as f:
+                      f.write(markdown)
+              write_outputs(item)
+          
+              for p in item["prs"]:
+                  if not p["ado_stories"]:
+                      print(f"::warning::PR #{p['number']} has no ADO story in its title: {p['title']}")
+              print(f"Release {release_version}: {len(item['prs'])} PR(s), change size {item['change_size'] or 'N/A'}, "
+                    f"{len(item['missing_ado'])} missing ADO story.")
+              return 0
+          
+          
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY
 
       - name: Upload release item
         uses: actions/upload-artifact@v4
