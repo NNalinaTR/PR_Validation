@@ -1,6 +1,15 @@
 name: Release Item Preparation
 
 on:
+  schedule:
+    # TEST ONLY: runs every 10 minutes regardless of the sprint date. Remove this line after testing
+    # and uncomment the sprint schedule below.
+    - cron: '*/10 * * * *'
+    # SPRINT SCHEDULE: daily at 17:15 UTC (22:45 IST), leaving buffer for GitHub's scheduling delay so the
+    # report is ready before 11:59 PM IST. The sprint-check job only lets the run continue on the day
+    # before each sprint ends (Nov 15, Nov 27, Dec 9, Dec 21, ... for 12-day sprints).
+    # Keep this value identical to SPRINT_CRON below.
+    # - cron: '15 17 * * *'
   workflow_dispatch:
     inputs:
       release_version:
@@ -18,9 +27,55 @@ permissions:
   contents: read
   pull-requests: read
 
+concurrency:
+  group: release-item-preparation
+  cancel-in-progress: false
+
+env:
+  # Sprint cadence: any sprint end date plus the sprint length in days.
+  SPRINT_END_ANCHOR: '2026-11-16'
+  SPRINT_LENGTH_DAYS: '12'
+  SPRINT_CRON: '15 17 * * *'
+
 jobs:
+  sprint-check:
+    name: Check sprint report day
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - name: Is today the day before the sprint ends?
+        id: check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+        shell: python
+        run: |
+          import os
+          from datetime import date, datetime, timedelta, timezone
+
+          today = datetime.now(timezone.utc).date()
+          anchor = date.fromisoformat(os.environ["SPRINT_END_ANCHOR"])
+          length = int(os.environ["SPRINT_LENGTH_DAYS"])
+          days_to_end = (anchor - today).days % length
+          next_report = today + timedelta(days=(days_to_end - 1) % length)
+
+          if os.environ["EVENT_NAME"] != "schedule":
+              run, reason = True, "manual run"
+          elif os.environ["EVENT_SCHEDULE"] != os.environ["SPRINT_CRON"]:
+              run, reason = True, f"non-sprint schedule '{os.environ['EVENT_SCHEDULE']}' (test)"
+          else:
+              run = days_to_end == 1
+              reason = "day before sprint end" if run else f"not the report day (next report day: {next_report})"
+
+          print(f"Today {today}; sprint ends in {days_to_end or length} day(s). Run: {run} ({reason})")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"run={'true' if run else 'false'}\n")
+
   release-item-preparation:
     name: 'Stage 1: Release item preparation'
+    needs: sprint-check
+    if: needs.sprint-check.outputs.run == 'true'
     runs-on: ubuntu-latest
     outputs:
       release_version: ${{ steps.prepare.outputs.release_version }}
