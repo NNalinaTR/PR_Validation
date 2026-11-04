@@ -1,0 +1,57 @@
+name: Release Item Preparation
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: 'Release version (blank = last RC minor + 1, e.g. 1.45.0-RC1 -> 1.46.0)'
+        required: false
+        default: ''
+        type: string
+      base_branch:
+        description: 'Branch RCs are cut from (blank = repository default branch)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  release-item-preparation:
+    name: 'Stage 1: Release item preparation'
+    runs-on: ubuntu-latest
+    outputs:
+      release_version: ${{ steps.prepare.outputs.release_version }}
+      last_rc: ${{ steps.prepare.outputs.last_rc }}
+      change_size: ${{ steps.prepare.outputs.change_size }}
+      pr_count: ${{ steps.prepare.outputs.pr_count }}
+      missing_ado_count: ${{ steps.prepare.outputs.missing_ado_count }}
+
+    steps:
+      - name: Checkout (all branches)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Prepare release item
+        id: prepare
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          BASE_BRANCH: ${{ inputs.base_branch }}
+        run: python .github/scripts/release_item_preparation.py
+
+      - name: Upload release item
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-item-${{ steps.prepare.outputs.release_version }}
+          path: |
+            release-item.md
+            release-item.json
